@@ -6,6 +6,15 @@ const Workout = require('../models/Workout');
 const DailyLog = require('../models/DailyLog');
 const AiPrompt = require('../models/AiPrompt');
 const { todayStr } = require('./nutritionController');
+const { estimateOffline } = require('../utils/offlineNutritionDB');
+const { getOfflineReply } = require('../utils/offlineCoach');
+
+// True when the failure is "OpenAI isn't usable right now" (missing key, no
+// quota/credits, rate limited) rather than some other bug — these are the
+// cases where we fall back to offline logic instead of just erroring out.
+function isAIUnavailable(err) {
+  return err.statusCode === 503 || err.status === 429 || err.code === 'insufficient_quota';
+}
 
 // Lazily create the client so a missing OPENAI_API_KEY only breaks AI
 // endpoints when they're actually called, not the whole server on boot.
@@ -31,9 +40,11 @@ suggest 2-3 concrete food options with approximate quantities to help them hit t
   meal_recognition: `You are a meal recognition assistant. Given a description or image of a meal, identify likely food items,
 estimate portion size, and estimate calories, protein, carbs, and fat. Respond ONLY in strict JSON with keys:
 items (array of {name, portion, calories, protein, carbs, fat}), totalCalories, totalProtein, totalCarbs, totalFat.`,
-  nutrition_estimate: `You are a nutrition database. Given a food name and a quantity in grams, estimate its nutrition
-as accurately as possible using standard nutrition data you know (USDA-style values per 100g, scaled to the given
-quantity). Respond ONLY with strict JSON, no prose, no markdown fences, using exactly these keys:
+  nutrition_estimate: `You are a nutrition database. Given a food name and a quantity (which may be in grams, milliliters,
+or common units like pieces/eggs/slices/cups/tablespoons/servings), estimate its nutrition as accurately as possible
+using standard nutrition data you know (USDA-style values), converting the given quantity to a realistic serving
+weight first (e.g. "2 large eggs" ≈ 100g, "1 medium banana" ≈ 118g) before calculating. Respond ONLY with strict
+JSON, no prose, no markdown fences, using exactly these keys:
 {"calories": number, "protein": number, "carbs": number, "fat": number, "fiber": number, "sugar": number}.
 All values are grams except calories (kcal), for the FULL given quantity (not per 100g). Round to the nearest whole number.`,
   weekly_report: `You are a fitness data analyst. Summarize the user's week: weight change, protein consistency, calorie
@@ -48,6 +59,19 @@ async function getPrompt(key) {
   return record ? record.systemPrompt : DEFAULT_PROMPTS[key];
 }
 
+// Maps a short unit code (used by the frontend dropdown) to a natural-language
+// label the AI prompt can use, e.g. quantityValue=2, unit='piece' -> "2 piece(s)".
+const UNIT_LABELS = {
+  g: 'g',
+  ml: 'ml',
+  piece: 'piece(s)',
+  cup: 'cup(s)',
+  tbsp: 'tablespoon(s)',
+  tsp: 'teaspoon(s)',
+  oz: 'oz',
+  serving: 'serving(s)',
+};
+
 // @desc AI chat coach - conversational, personalized
 // @route POST /api/ai/chat
 const chatWithCoach = asyncHandler(async (req, res) => {
@@ -56,28 +80,38 @@ const chatWithCoach = asyncHandler(async (req, res) => {
 
   await ChatMessage.create({ user: user._id, role: 'user', content: message });
 
-  const history = await ChatMessage.find({ user: user._id }).sort({ createdAt: -1 }).limit(10);
-  const systemPrompt = await getPrompt('chat_coach');
+  let reply;
+  let offline = false;
 
-  const profileContext = `User profile: goal=${user.goal}, dailyCalories=${user.dailyCalories}, ` +
-    `dailyProtein=${user.dailyProtein}g, dailyCarbs=${user.dailyCarbs}g, dailyFat=${user.dailyFat}g, ` +
-    `dietaryPreference=${user.dietaryPreference}, activityLevel=${user.activityLevel}, workoutExperience=${user.workoutExperience}.`;
+  try {
+    const history = await ChatMessage.find({ user: user._id }).sort({ createdAt: -1 }).limit(10);
+    const systemPrompt = await getPrompt('chat_coach');
 
-  const messages = [
-    { role: 'system', content: `${systemPrompt}\n\n${profileContext}` },
-    ...history.reverse().map((m) => ({ role: m.role, content: m.content })),
-  ];
+    const profileContext = `User profile: goal=${user.goal}, dailyCalories=${user.dailyCalories}, ` +
+      `dailyProtein=${user.dailyProtein}g, dailyCarbs=${user.dailyCarbs}g, dailyFat=${user.dailyFat}g, ` +
+      `dietaryPreference=${user.dietaryPreference}, activityLevel=${user.activityLevel}, workoutExperience=${user.workoutExperience}.`;
 
-  const completion = await getOpenAI().chat.completions.create({
-    model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-    messages,
-    temperature: 0.7,
-  });
+    const messages = [
+      { role: 'system', content: `${systemPrompt}\n\n${profileContext}` },
+      ...history.reverse().map((m) => ({ role: m.role, content: m.content })),
+    ];
 
-  const reply = completion.choices[0].message.content;
+    const completion = await getOpenAI().chat.completions.create({
+      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+      messages,
+      temperature: 0.7,
+    });
+
+    reply = completion.choices[0].message.content;
+  } catch (err) {
+    if (!isAIUnavailable(err)) throw err;
+    offline = true;
+    reply = getOfflineReply(message, user);
+  }
+
   await ChatMessage.create({ user: user._id, role: 'assistant', content: reply });
 
-  res.json({ success: true, reply });
+  res.json({ success: true, reply, offline });
 });
 
 // @desc Get chat history
@@ -203,46 +237,66 @@ const getMonthlyReport = asyncHandler(async (req, res) => {
 });
 
 // @desc Estimate nutrition (calories/protein/carbs/fat/fiber/sugar) for a food name + quantity,
-// so the user never has to type macros by hand when logging a meal.
+// so the user never has to type macros by hand when logging a meal. Quantity can be grams, ml,
+// or a natural unit like "piece", "cup", "tbsp", "serving" — e.g. 2 "piece" of eggs.
 // @route POST /api/ai/estimate-nutrition
 const estimateNutrition = asyncHandler(async (req, res) => {
-  const { name, quantityG } = req.body;
+  const { name, quantityValue, unit } = req.body;
 
-  if (!name || !quantityG) {
+  if (!name || !quantityValue) {
     res.status(400);
-    throw new Error('Provide both a food name and a quantity in grams');
+    throw new Error('Provide a food name and a quantity');
   }
 
-  const systemPrompt = await getPrompt('nutrition_estimate');
-  const completion = await getOpenAI().chat.completions.create({
-    model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: `Food: ${name}. Quantity: ${quantityG}g.` },
-    ],
-    temperature: 0.2,
-    response_format: { type: 'json_object' },
-  });
+  const unitLabel = UNIT_LABELS[unit] || unit || 'g';
+  const quantityDescription = `${quantityValue} ${unitLabel}`;
 
-  let parsed;
   try {
-    parsed = JSON.parse(completion.choices[0].message.content);
-  } catch (e) {
-    res.status(502);
-    throw new Error('AI returned an unexpected response — try rewording the food name');
+    const systemPrompt = await getPrompt('nutrition_estimate');
+    const completion = await getOpenAI().chat.completions.create({
+      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `Food: ${name}. Quantity: ${quantityDescription}.` },
+      ],
+      temperature: 0.2,
+      response_format: { type: 'json_object' },
+    });
+
+    let parsed;
+    try {
+      parsed = JSON.parse(completion.choices[0].message.content);
+    } catch (e) {
+      res.status(502);
+      throw new Error('AI returned an unexpected response — try rewording the food name');
+    }
+
+    const toNum = (v) => (typeof v === 'number' && !isNaN(v) ? Math.round(v) : 0);
+    const nutrition = {
+      calories: toNum(parsed.calories),
+      protein: toNum(parsed.protein),
+      carbs: toNum(parsed.carbs),
+      fat: toNum(parsed.fat),
+      fiber: toNum(parsed.fiber),
+      sugar: toNum(parsed.sugar),
+    };
+
+    return res.json({ success: true, nutrition, quantityDescription, offline: false });
+  } catch (err) {
+    if (!isAIUnavailable(err)) throw err;
+
+    // AI is down — try the built-in offline database for common foods before
+    // giving up and asking the user to enter macros manually.
+    const offlineResult = estimateOffline(name, quantityValue, unit);
+    if (offlineResult) {
+      return res.json({ success: true, nutrition: offlineResult, quantityDescription, offline: true });
+    }
+
+    res.status(503);
+    throw new Error(
+      `AI is unavailable and "${name}" isn't in the offline database. Please enter the macros manually below.`
+    );
   }
-
-  const toNum = (v) => (typeof v === 'number' && !isNaN(v) ? Math.round(v) : 0);
-  const nutrition = {
-    calories: toNum(parsed.calories),
-    protein: toNum(parsed.protein),
-    carbs: toNum(parsed.carbs),
-    fat: toNum(parsed.fat),
-    fiber: toNum(parsed.fiber),
-    sugar: toNum(parsed.sugar),
-  };
-
-  res.json({ success: true, nutrition });
 });
 
 module.exports = {

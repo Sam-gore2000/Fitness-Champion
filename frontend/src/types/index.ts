@@ -41,6 +41,8 @@ export interface Meal {
   mealType: 'breakfast' | 'lunch' | 'dinner' | 'snack';
   source: 'manual' | 'search' | 'barcode' | 'image' | 'voice';
   quantityG: number;
+  quantityValue?: number;
+  quantityUnit?: 'g' | 'ml' | 'piece' | 'cup' | 'tbsp' | 'tsp' | 'oz' | 'serving';
   calories: number;
   protein: number;
   carbs: number;
@@ -74,10 +76,13 @@ export interface ExerciseSet {
   isPR?: boolean;
 }
 
+export type MuscleGroup = 'chest' | 'back' | 'biceps' | 'triceps' | 'legs' | 'shoulders' | 'core' | 'cardio' | 'full_body';
+
 export interface ExerciseEntry {
   name: string;
-  muscleGroup?: string;
+  muscleGroup?: MuscleGroup;
   sets: ExerciseSet[];
+  durationMinutes?: number;
 }
 
 export interface Workout {

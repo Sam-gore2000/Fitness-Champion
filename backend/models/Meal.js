@@ -16,6 +16,12 @@ const mealSchema = new mongoose.Schema(
       default: 'manual',
     },
     quantityG: { type: Number, default: 100 },
+    quantityValue: { type: Number, default: 100 },
+    quantityUnit: {
+      type: String,
+      enum: ['g', 'ml', 'piece', 'cup', 'tbsp', 'tsp', 'oz', 'serving'],
+      default: 'g',
+    },
     calories: { type: Number, required: true },
     protein: { type: Number, required: true },
     carbs: { type: Number, required: true },

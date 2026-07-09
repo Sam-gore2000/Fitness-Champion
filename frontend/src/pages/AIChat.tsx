@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import toast from 'react-hot-toast';
 import { Send, Sparkles, Lightbulb } from 'lucide-react';
 import { aiApi } from '@/api/aiApi';
 import GlassCard from '@/components/ui/GlassCard';
@@ -23,7 +24,16 @@ export default function AIChat() {
 
   const chatMutation = useMutation({
     mutationFn: aiApi.chat,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['chat-history'] }),
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({ queryKey: ['chat-history'] });
+      if (res.data.offline) {
+        toast('AI is offline — showing a general tip instead of a personalized answer', { icon: 'ℹ️' });
+      }
+    },
+    onError: (err: any) => {
+      queryClient.invalidateQueries({ queryKey: ['chat-history'] });
+      toast.error(err?.response?.data?.message || 'AI coach is unavailable right now');
+    },
   });
 
   useEffect(() => {

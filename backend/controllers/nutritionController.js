@@ -40,7 +40,7 @@ const searchFoods = asyncHandler(async (req, res) => {
 // @route POST /api/nutrition/meals
 const logMeal = asyncHandler(async (req, res) => {
   const {
-    name, mealType, source, quantityG,
+    name, mealType, source, quantityG, quantityValue, quantityUnit,
     calories, protein, carbs, fat, fiber, sugar, foodId, imageUrl,
   } = req.body;
 
@@ -50,7 +50,9 @@ const logMeal = asyncHandler(async (req, res) => {
     name,
     mealType,
     source: source || 'manual',
-    quantityG,
+    quantityG: quantityG ?? (quantityUnit === 'g' || quantityUnit === 'ml' ? quantityValue : 100),
+    quantityValue,
+    quantityUnit,
     calories, protein, carbs, fat,
     fiber: fiber || 0,
     sugar: sugar || 0,

@@ -13,8 +13,13 @@ const setSchema = new mongoose.Schema(
 const exerciseEntrySchema = new mongoose.Schema(
   {
     name: { type: String, required: true },
-    muscleGroup: String,
+    muscleGroup: {
+      type: String,
+      enum: ['chest', 'back', 'biceps', 'triceps', 'legs', 'shoulders', 'core', 'cardio', 'full_body'],
+      default: 'full_body',
+    },
     sets: [setSchema],
+    durationMinutes: Number, // used instead of sets for cardio-type entries
   },
   { _id: false }
 );

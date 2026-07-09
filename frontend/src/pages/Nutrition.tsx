@@ -11,9 +11,20 @@ import EmptyState from '@/components/ui/EmptyState';
 import type { Meal } from '@/types';
 
 const MEAL_TYPES = ['breakfast', 'lunch', 'dinner', 'snack'] as const;
+const UNIT_OPTIONS = [
+  { value: 'g', label: 'grams (g)' },
+  { value: 'ml', label: 'millilitres (ml)' },
+  { value: 'piece', label: 'piece(s) — e.g. 2 eggs, 1 banana' },
+  { value: 'cup', label: 'cup(s)' },
+  { value: 'tbsp', label: 'tablespoon(s)' },
+  { value: 'tsp', label: 'teaspoon(s)' },
+  { value: 'oz', label: 'ounce(s)' },
+  { value: 'serving', label: 'serving(s)' },
+] as const;
 
 const EMPTY_FORM = {
-  name: '', mealType: 'lunch' as typeof MEAL_TYPES[number], quantityG: 100,
+  name: '', mealType: 'lunch' as typeof MEAL_TYPES[number],
+  quantityValue: 1, quantityUnit: 'piece' as typeof UNIT_OPTIONS[number]['value'],
   calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0, sugar: 0,
 };
 
@@ -65,20 +76,24 @@ export default function Nutrition() {
     },
   });
 
-  // Core feature: user only types a food name + quantity, AI fills in the macros.
+  // Core feature: user only types a food name + a natural quantity (grams, ml,
+  // or "2 eggs" / "1 cup" etc.), AI fills in the macros. If AI is down, the
+  // backend tries a small offline nutrition database; only if that also has
+  // no match do we fall back to manual entry.
   const handleAnalyze = async () => {
-    if (!form.name.trim() || !form.quantityG) {
+    if (!form.name.trim() || !form.quantityValue) {
       toast.error('Enter a food name and quantity first');
       return;
     }
     setAnalyzing(true);
     try {
-      const { data } = await aiApi.estimateNutrition(form.name, form.quantityG);
+      const { data } = await aiApi.estimateNutrition(form.name, form.quantityValue, form.quantityUnit);
       setForm((f) => ({ ...f, ...data.nutrition }));
       setAnalyzed(true);
-      toast.success('Nutrition estimated — review and log it');
+      toast.success(data.offline ? 'Estimated using offline database — review and log it' : 'Nutrition estimated — review and log it');
     } catch (err: any) {
-      toast.error(err?.response?.data?.message || 'Could not estimate nutrition, try rewording the food name');
+      toast.error(err?.response?.data?.message || 'Could not estimate nutrition — enter the macros manually below');
+      setManualOverride(true); // don't leave the user stuck, drop straight into manual entry
     } finally {
       setAnalyzing(false);
     }
@@ -93,7 +108,8 @@ export default function Nutrition() {
         setForm({
           name: (totals.items?.map((i: any) => i.name).join(', ')) || 'AI-recognized meal',
           mealType: 'lunch',
-          quantityG: 100,
+          quantityValue: 1,
+          quantityUnit: 'serving',
           calories: totals.totalCalories,
           protein: totals.totalProtein,
           carbs: totals.totalCarbs,
@@ -155,7 +171,10 @@ export default function Nutrition() {
                   <div key={m._id} className="flex items-center justify-between p-3 rounded-2xl bg-slate-50 dark:bg-slate-800/50">
                     <div>
                       <p className="text-sm font-medium text-slate-700 dark:text-slate-200">{m.name}</p>
-                      <p className="text-xs text-slate-400">{m.calories} kcal &middot; P{m.protein}g C{m.carbs}g F{m.fat}g</p>
+                      <p className="text-xs text-slate-400">
+                        {m.quantityValue ? `${m.quantityValue} ${m.quantityUnit === 'piece' ? 'pc' : m.quantityUnit} · ` : ''}
+                        {m.calories} kcal &middot; P{m.protein}g C{m.carbs}g F{m.fat}g
+                      </p>
                     </div>
                     <button onClick={() => deleteMealMutation.mutate(m._id)} className="p-2 text-slate-400 hover:text-danger-500 rounded-xl hover:bg-danger-50 dark:hover:bg-danger-500/10">
                       <Trash2 size={16} />
@@ -185,18 +204,26 @@ export default function Nutrition() {
             onChange={(e) => { setForm({ ...form, name: e.target.value }); setAnalyzed(false); }}
           />
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-[1fr_1.4fr] gap-3">
             <input
               type="number"
-              placeholder="Quantity (g)"
+              min={1}
+              placeholder="Qty"
               className="input-field"
-              value={form.quantityG || ''}
-              onChange={(e) => { setForm({ ...form, quantityG: Number(e.target.value) }); setAnalyzed(false); }}
+              value={form.quantityValue || ''}
+              onChange={(e) => { setForm({ ...form, quantityValue: Number(e.target.value) }); setAnalyzed(false); }}
             />
-            <select className="input-field" value={form.mealType} onChange={(e) => setForm({ ...form, mealType: e.target.value as any })}>
-              {MEAL_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+            <select
+              className="input-field"
+              value={form.quantityUnit}
+              onChange={(e) => { setForm({ ...form, quantityUnit: e.target.value as any }); setAnalyzed(false); }}
+            >
+              {UNIT_OPTIONS.map((u) => <option key={u.value} value={u.value}>{u.label}</option>)}
             </select>
           </div>
+          <select className="input-field" value={form.mealType} onChange={(e) => setForm({ ...form, mealType: e.target.value as any })}>
+            {MEAL_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
 
           {!showMacroFields && (
             <Button type="button" onClick={handleAnalyze} loading={analyzing} className="w-full">
